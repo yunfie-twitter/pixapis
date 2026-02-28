@@ -1,0 +1,25 @@
+# Web Framework
+fastapi==0.109.2
+uvicorn[standard]==0.27.1
+
+# HTTP Client
+httpx==0.26.0
+
+# HTML Parsing
+beautifulsoup4==4.12.3
+lxml==5.1.0
+
+# Data Validation
+pydantic==2.6.1
+pydantic-settings==2.1.0
+
+# Caching
+redis==5.0.1
+hiredis==2.3.2  # Performance boost for Redis
+
+# Utilities
+python-dotenv==1.0.1
+python-multipart==0.0.9
+
+# Monitoring (Optional)
+prometheus-fastapi-instrumentator==6.1.0
