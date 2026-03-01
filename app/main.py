@@ -1,11 +1,12 @@
 """FastAPI application entry point for Pixiv API scraper."""
 
-from fastapi import FastAPI, HTTPException, status, Query
+from fastapi import FastAPI, HTTPException, status, Query, Path
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 import logging
 from contextlib import asynccontextmanager
 from typing import Optional, List
+import io
 
 from app.models import ArtworkResponse, HealthResponse, ErrorResponse
 from app.scraper import PixivScraper
@@ -90,14 +91,16 @@ async def health_check():
          },
          tags=["Artworks"])
 async def get_artwork(
-    artwork_id: int,
-    force_scraping: bool = Query(False, description="Force HTML scraping instead of using API")
+    artwork_id: int = Path(..., description="Pixiv artwork ID"),
+    force_scraping: bool = Query(False, description="Force HTML scraping instead of using API"),
+    include_related: bool = Query(False, description="Include related artworks (requires API)")
 ):
     """Get artwork information by ID.
     
     Args:
         artwork_id: Pixiv artwork ID (e.g., 141733795)
         force_scraping: Force HTML scraping mode (bypass API)
+        include_related: Include related artworks list
     
     Returns:
         ArtworkResponse with metadata and image URLs
@@ -116,6 +119,19 @@ async def get_artwork(
                 artwork = await api_client.get_artwork(artwork_id)
                 if artwork:
                     logger.info(f"Successfully fetched artwork {artwork_id} from official API")
+                    
+                    # Get related artworks if requested
+                    if include_related:
+                        try:
+                            related_data = api_client.illust_related(artwork_id)
+                            related_ids = [
+                                illust.get("id") 
+                                for illust in related_data.get("illusts", [])[:10]
+                                if illust.get("id")
+                            ]
+                            artwork.related_artworks = related_ids
+                        except Exception as e:
+                            logger.warning(f"Failed to fetch related artworks: {e}")
             except Exception as e:
                 logger.warning(f"Official API failed for artwork {artwork_id}: {e}")
         
@@ -139,6 +155,126 @@ async def get_artwork(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to fetch artwork: {str(e)}"
+        )
+
+
+@app.get("/artworks/{artwork_id}/pages/{page_number}",
+         tags=["Artworks"],
+         summary="Get specific page of multi-page artwork")
+async def get_artwork_page(
+    artwork_id: int = Path(..., description="Pixiv artwork ID"),
+    page_number: int = Path(..., description="Page number (0-indexed)", ge=0)
+):
+    """Get specific page information from multi-page artwork.
+    
+    Returns only the URL and metadata for the specified page.
+    """
+    try:
+        artwork = await scraper.get_artwork(artwork_id)
+        
+        if not artwork:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Artwork {artwork_id} not found"
+            )
+        
+        if page_number >= len(artwork.images):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Page {page_number} does not exist (artwork has {len(artwork.images)} pages)"
+            )
+        
+        return {
+            "artwork_id": artwork_id,
+            "page_number": page_number,
+            "total_pages": len(artwork.images),
+            "image": artwork.images[page_number]
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching page {page_number} of artwork {artwork_id}: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+
+@app.get("/artworks/{artwork_id}/download",
+         tags=["Artworks"],
+         summary="Download artwork image(s)")
+async def download_artwork(
+    artwork_id: int = Path(..., description="Pixiv artwork ID"),
+    page: Optional[int] = Query(None, description="Specific page to download (for multi-page artworks)", ge=0),
+    thumbnail: bool = Query(False, description="Download thumbnail instead of original")
+):
+    """Download artwork image.
+    
+    For single-page artworks, downloads the image directly.
+    For multi-page artworks, specify page parameter or get ZIP of all pages.
+    """
+    try:
+        artwork = await scraper.get_artwork(artwork_id)
+        
+        if not artwork:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Artwork {artwork_id} not found"
+            )
+        
+        if not artwork.images:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No images available for this artwork"
+            )
+        
+        # Determine which image to download
+        if page is not None:
+            if page >= len(artwork.images):
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Page {page} does not exist"
+                )
+            image = artwork.images[page]
+        else:
+            # Default to first image for single-page, or require page param for multi-page
+            if len(artwork.images) > 1:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Multi-page artwork ({len(artwork.images)} pages). Specify 'page' parameter."
+                )
+            image = artwork.images[0]
+        
+        # Get URL (thumbnail or original)
+        url = image.thumbnail if thumbnail and image.thumbnail else image.url
+        
+        if not url:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Image URL not available"
+            )
+        
+        # Get filename
+        filename = scraper.get_download_filename(url)
+        
+        # Return download info (client should download with proper headers)
+        return {
+            "artwork_id": artwork_id,
+            "page": page or 0,
+            "url": url,
+            "filename": filename,
+            "referer": f"https://www.pixiv.net/artworks/{artwork_id}",
+            "note": "Use the provided URL with 'Referer' header set to download the image"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error preparing download for artwork {artwork_id}: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
         )
 
 
@@ -211,20 +347,35 @@ async def search_illustrations(
 @app.get("/users/{user_id}",
          tags=["Users"],
          summary="Get user detail")
-async def get_user_detail(user_id: int):
+async def get_user_detail(
+    user_id: int = Path(..., description="Pixiv user ID"),
+    force_scraping: bool = Query(False, description="Force Ajax scraping instead of API")
+):
     """Get user detail information.
     
-    Requires official API to be enabled.
+    Uses official API if available, falls back to Ajax endpoint.
     """
-    if not api_client:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Official API not available. Please set PIXIV_REFRESH_TOKEN."
-        )
-    
     try:
-        result = api_client.user_detail(user_id)
-        return result
+        # Try official API first
+        if not force_scraping and api_client:
+            try:
+                result = api_client.user_detail(user_id)
+                return result
+            except Exception as e:
+                logger.warning(f"Official API failed for user {user_id}: {e}")
+        
+        # Fallback to Ajax endpoint
+        user_data = scraper.get_user_ajax(user_id)
+        if user_data:
+            return {"user": user_data}
+        
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"User {user_id} not found"
+        )
+        
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error fetching user detail: {str(e)}")
         raise HTTPException(
@@ -237,7 +388,7 @@ async def get_user_detail(user_id: int):
          tags=["Users"],
          summary="Get user illustrations")
 async def get_user_illustrations(
-    user_id: int,
+    user_id: int = Path(..., description="Pixiv user ID"),
     type: str = Query("illust", description="Content type: illust, manga"),
     offset: Optional[int] = Query(None, description="Pagination offset"),
 ):
