@@ -1,13 +1,15 @@
 """FastAPI application entry point for Pixiv API scraper."""
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, status, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import logging
 from contextlib import asynccontextmanager
+from typing import Optional, List
 
 from app.models import ArtworkResponse, HealthResponse, ErrorResponse
 from app.scraper import PixivScraper
+from app.pixiv_api import PixivAppAPI
 from app.config import settings
 
 # Configure logging
@@ -17,17 +19,34 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Initialize scraper instance
+# Initialize scraper and API client
 scraper = PixivScraper()
+api_client: Optional[PixivAppAPI] = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
+    global api_client
+    
     # Startup
     logger.info(f"Starting Pixiv API Service v{settings.version}")
     logger.info(f"Workers: {settings.api_workers}")
     logger.info(f"Cache enabled: {settings.redis_url is not None}")
+    logger.info(f"Official API enabled: {settings.use_official_api}")
+    
+    # Initialize official API client if enabled and refresh_token is available
+    if settings.use_official_api and settings.pixiv_refresh_token:
+        try:
+            api_client = PixivAppAPI(refresh_token=settings.pixiv_refresh_token)
+            api_client.auth()
+            logger.info("Official Pixiv API client initialized successfully")
+        except Exception as e:
+            logger.warning(f"Failed to initialize official API client: {e}")
+            logger.warning("Will fallback to HTML scraping only")
+            api_client = None
+    else:
+        logger.info("Official API disabled or refresh_token not set, using HTML scraping only")
     
     yield
     
@@ -38,7 +57,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Pixiv API",
-    description="Pixiv artwork metadata and image URL extraction API",
+    description="Pixiv artwork metadata and image URL extraction API with official API support",
     version=settings.version,
     lifespan=lifespan,
 )
@@ -70,11 +89,15 @@ async def health_check():
              500: {"model": ErrorResponse, "description": "Scraping failed"},
          },
          tags=["Artworks"])
-async def get_artwork(artwork_id: int):
+async def get_artwork(
+    artwork_id: int,
+    force_scraping: bool = Query(False, description="Force HTML scraping instead of using API")
+):
     """Get artwork information by ID.
     
     Args:
         artwork_id: Pixiv artwork ID (e.g., 141733795)
+        force_scraping: Force HTML scraping mode (bypass API)
     
     Returns:
         ArtworkResponse with metadata and image URLs
@@ -84,7 +107,22 @@ async def get_artwork(artwork_id: int):
     """
     try:
         logger.info(f"Fetching artwork {artwork_id}")
-        artwork = await scraper.get_artwork(artwork_id)
+        artwork = None
+        
+        # Try official API first (if enabled and not forced to scrape)
+        if not force_scraping and api_client:
+            try:
+                logger.info(f"Trying official API for artwork {artwork_id}")
+                artwork = await api_client.get_artwork(artwork_id)
+                if artwork:
+                    logger.info(f"Successfully fetched artwork {artwork_id} from official API")
+            except Exception as e:
+                logger.warning(f"Official API failed for artwork {artwork_id}: {e}")
+        
+        # Fallback to HTML scraping
+        if not artwork:
+            logger.info(f"Using HTML scraping for artwork {artwork_id}")
+            artwork = await scraper.get_artwork(artwork_id)
         
         if not artwork:
             raise HTTPException(
@@ -101,6 +139,159 @@ async def get_artwork(artwork_id: int):
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to fetch artwork: {str(e)}"
+        )
+
+
+@app.get("/ranking",
+         tags=["Ranking"],
+         summary="Get illustration ranking")
+async def get_ranking(
+    mode: str = Query("day", description="Ranking mode: day, week, month, day_male, day_female, week_original, week_rookie, day_manga"),
+    date: Optional[str] = Query(None, description="Date in YYYY-MM-DD format"),
+    offset: Optional[int] = Query(None, description="Pagination offset"),
+):
+    """Get illustration ranking.
+    
+    Requires official API to be enabled.
+    """
+    if not api_client:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Official API not available. Please set PIXIV_REFRESH_TOKEN."
+        )
+    
+    try:
+        result = api_client.illust_ranking(mode=mode, date=date, offset=offset)
+        return result
+    except Exception as e:
+        logger.error(f"Error fetching ranking: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch ranking: {str(e)}"
+        )
+
+
+@app.get("/search",
+         tags=["Search"],
+         summary="Search illustrations")
+async def search_illustrations(
+    word: str = Query(..., description="Search keyword"),
+    search_target: str = Query("partial_match_for_tags", description="Search target: partial_match_for_tags, exact_match_for_tags, title_and_caption"),
+    sort: str = Query("date_desc", description="Sort order: date_desc, date_asc, popular_desc"),
+    duration: Optional[str] = Query(None, description="Duration filter: within_last_day, within_last_week, within_last_month"),
+    offset: Optional[int] = Query(None, description="Pagination offset"),
+):
+    """Search illustrations by keyword.
+    
+    Requires official API to be enabled.
+    """
+    if not api_client:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Official API not available. Please set PIXIV_REFRESH_TOKEN."
+        )
+    
+    try:
+        result = api_client.search_illust(
+            word=word,
+            search_target=search_target,
+            sort=sort,
+            duration=duration,
+            offset=offset
+        )
+        return result
+    except Exception as e:
+        logger.error(f"Error searching illustrations: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to search illustrations: {str(e)}"
+        )
+
+
+@app.get("/users/{user_id}",
+         tags=["Users"],
+         summary="Get user detail")
+async def get_user_detail(user_id: int):
+    """Get user detail information.
+    
+    Requires official API to be enabled.
+    """
+    if not api_client:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Official API not available. Please set PIXIV_REFRESH_TOKEN."
+        )
+    
+    try:
+        result = api_client.user_detail(user_id)
+        return result
+    except Exception as e:
+        logger.error(f"Error fetching user detail: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch user detail: {str(e)}"
+        )
+
+
+@app.get("/users/{user_id}/illusts",
+         tags=["Users"],
+         summary="Get user illustrations")
+async def get_user_illustrations(
+    user_id: int,
+    type: str = Query("illust", description="Content type: illust, manga"),
+    offset: Optional[int] = Query(None, description="Pagination offset"),
+):
+    """Get user's illustration list.
+    
+    Requires official API to be enabled.
+    """
+    if not api_client:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Official API not available. Please set PIXIV_REFRESH_TOKEN."
+        )
+    
+    try:
+        result = api_client.user_illusts(user_id=user_id, type=type, offset=offset)
+        return result
+    except Exception as e:
+        logger.error(f"Error fetching user illustrations: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch user illustrations: {str(e)}"
+        )
+
+
+@app.get("/recommended",
+         tags=["Recommendations"],
+         summary="Get recommended illustrations")
+async def get_recommended(
+    content_type: str = Query("illust", description="Content type: illust, manga"),
+    include_ranking_label: bool = Query(True, description="Include ranking label"),
+    offset: Optional[int] = Query(None, description="Pagination offset"),
+):
+    """Get recommended illustrations.
+    
+    Requires official API to be enabled.
+    """
+    if not api_client:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Official API not available. Please set PIXIV_REFRESH_TOKEN."
+        )
+    
+    try:
+        result = api_client.illust_recommended(
+            content_type=content_type,
+            include_ranking_label=include_ranking_label,
+            offset=offset
+        )
+        return result
+    except Exception as e:
+        logger.error(f"Error fetching recommended illustrations: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch recommended illustrations: {str(e)}"
         )
 
 
