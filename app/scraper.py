@@ -1,148 +1,259 @@
-"""Pixiv HTML scraper implementation."""
+"""Enhanced Pixiv HTML scraper with Ajax endpoint support."""
 
-import httpx
-from bs4 import BeautifulSoup
 import re
 import json
-from typing import Optional, Dict, Any, List
-from datetime import datetime
 import logging
+from typing import Optional, List, Dict, Any
+from datetime import datetime
+import os
+import httpx
+from requests import Session
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from bs4 import BeautifulSoup
 
 from app.models import (
     ArtworkResponse, AuthorInfo, ImageInfo,
     ArtworkStats
 )
 from app.config import settings
-from app.utils import parse_stat_number, extract_user_id_from_url
 
 logger = logging.getLogger(__name__)
 
 
 class PixivScraper:
-    """Scraper for Pixiv artwork pages."""
+    """Enhanced Pixiv scraper with Ajax API and HTML fallback."""
 
     BASE_URL = "https://www.pixiv.net"
-    ARTWORK_URL_TEMPLATE = "https://www.pixiv.net/artworks/{}"
+    AJAX_BASE = "https://www.pixiv.net/ajax"
+    CHUNK_SIZE = 1048576  # 1MB chunks for downloads
 
-    def __init__(self):
-        self.headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            "Referer": "https://www.pixiv.net/",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
-        }
-
-        cookies = {}
-        if settings.pixiv_session:
-            cookies["PHPSESSID"] = settings.pixiv_session
-
+    def __init__(self, session_id: Optional[str] = None):
+        """Initialize scraper.
+        
+        Args:
+            session_id: PHPSESSID cookie value for authenticated requests
+        """
+        self.session_id = session_id or settings.pixiv_session
+        
+        # Setup requests session with retry logic
+        self.session = Session()
+        retries = Retry(
+            total=5,
+            backoff_factor=0.1,
+            status_forcelist=[500, 502, 503, 504]
+        )
+        self.session.mount("http://", HTTPAdapter(max_retries=retries))
+        self.session.mount("https://", HTTPAdapter(max_retries=retries))
+        
+        # Setup httpx client for async operations
         self.client = httpx.AsyncClient(
-            headers=self.headers,
-            cookies=cookies,
             timeout=30.0,
             follow_redirects=True,
+            limits=httpx.Limits(max_keepalive_connections=20)
         )
+        
+        # Setup headers
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": "https://www.pixiv.net/",
+            "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+        }
+        
+        if self.session_id:
+            self.headers["Cookie"] = f"PHPSESSID={self.session_id}"
+            logger.info("Scraper initialized with authentication")
+        else:
+            logger.warning("Scraper initialized without authentication (R-18 content unavailable)")
 
     async def close(self):
+        """Close HTTP clients."""
         await self.client.aclose()
+        self.session.close()
 
-    async def fetch_html(self, url: str) -> Optional[str]:
+    def _make_request(self, url: str, method: str = "GET", **kwargs) -> Any:
+        """Make HTTP request with retry logic.
+        
+        Args:
+            url: Target URL
+            method: HTTP method
+            **kwargs: Additional request parameters
+            
+        Returns:
+            Response object
+        """
+        headers = kwargs.pop("headers", {})
+        merged_headers = {**self.headers, **headers}
+        
         try:
-            response = await self.client.get(url)
-            response.raise_for_status()
-            return response.text
-        except httpx.HTTPStatusError as e:
-            logger.error(f"HTTP error fetching {url}: {e.response.status_code}")
-            return None
-        except Exception as e:
-            logger.error(f"Error fetching {url}: {str(e)}")
-            return None
-
-    def extract_meta_preload_json(self, html: str) -> Optional[Dict[str, Any]]:
-        """Extract preload JSON from <meta id=meta-preload-data content='...'>."""
-        try:
-            soup = BeautifulSoup(html, "lxml")
-            meta_tag = soup.find("meta", {"id": "meta-preload-data"})
-            if meta_tag and meta_tag.get("content"):
-                return json.loads(meta_tag["content"])
-            return None
-        except Exception as e:
-            logger.error(f"Error extracting meta-preload-data JSON: {str(e)}")
-            return None
-
-    def extract_next_data_json(self, html: str) -> Optional[Dict[str, Any]]:
-        """Extract JSON from <script id="__NEXT_DATA__" type="application/json">."""
-        try:
-            soup = BeautifulSoup(html, "lxml")
-            script = soup.find("script", {"id": "__NEXT_DATA__"})
-            if not script:
-                return None
-            text = script.string or script.get_text(strip=False)
-            if not text:
-                return None
-            return json.loads(text)
-        except Exception as e:
-            logger.error(f"Error extracting __NEXT_DATA__ JSON: {str(e)}")
-            return None
-
-    def _build_artwork_response(self, illust: Dict[str, Any], artwork_id: int) -> Optional[ArtworkResponse]:
-        try:
-            author = AuthorInfo(
-                id=int(illust.get("userId") or 0),
-                name=illust.get("userName") or "Unknown",
-                avatar_url=illust.get("profileImageUrl"),
-            )
-
-            page_count = int(illust.get("pageCount") or 1)
-            images = []
-
-            urls = illust.get("urls") or {}
-            if page_count == 1:
-                original_url = urls.get("original")
-                thumb_url = urls.get("small") or urls.get("thumb") or urls.get("regular")
-                if original_url:
-                    images.append(
-                        ImageInfo(
-                            url=original_url,
-                            thumbnail=thumb_url,
-                            width=illust.get("width"),
-                            height=illust.get("height"),
-                        )
-                    )
+            if method == "GET":
+                response = self.session.get(url, headers=merged_headers, **kwargs)
+            elif method == "POST":
+                response = self.session.post(url, headers=merged_headers, **kwargs)
             else:
-                base_original = urls.get("original")
-                if base_original:
-                    for i in range(page_count):
-                        images.append(ImageInfo(url=base_original.replace("_p0", f"_p{i}")))
+                raise ValueError(f"Unsupported method: {method}")
+            
+            response.raise_for_status()
+            return response
+        except Exception as e:
+            logger.error(f"Request failed: {method} {url} - {str(e)}")
+            raise
 
-            tags = [t.get("tag", "") for t in (illust.get("tags") or {}).get("tags", []) if t.get("tag")]
+    def get_artwork_ajax(self, artwork_id: int) -> Optional[Dict[str, Any]]:
+        """Get artwork data from Ajax endpoint.
+        
+        Args:
+            artwork_id: Pixiv artwork ID
+            
+        Returns:
+            Artwork data dict or None if failed
+        """
+        try:
+            url = f"{self.AJAX_BASE}/illust/{artwork_id}"
+            response = self._make_request(url)
+            data = response.json()
+            
+            if data.get("error"):
+                logger.warning(f"Ajax API returned error for artwork {artwork_id}: {data.get('message')}")
+                return None
+            
+            return data.get("body")
+        except Exception as e:
+            logger.error(f"Failed to fetch artwork via Ajax: {str(e)}")
+            return None
 
-            stats = ArtworkStats(
-                likes=int(illust.get("likeCount") or 0),
-                bookmarks=int(illust.get("bookmarkCount") or 0),
-                views=int(illust.get("viewCount") or 0),
+    def get_ugoira_metadata(self, artwork_id: int) -> Optional[Dict[str, Any]]:
+        """Get Ugoira (animation) metadata.
+        
+        Args:
+            artwork_id: Pixiv artwork ID
+            
+        Returns:
+            Ugoira metadata dict or None if failed
+        """
+        try:
+            url = f"{self.AJAX_BASE}/illust/{artwork_id}/ugoira_meta"
+            response = self._make_request(url)
+            data = response.json()
+            
+            if data.get("error"):
+                return None
+            
+            return data.get("body")
+        except Exception as e:
+            logger.error(f"Failed to fetch ugoira metadata: {str(e)}")
+            return None
+
+    def get_user_ajax(self, user_id: int) -> Optional[Dict[str, Any]]:
+        """Get user data from Ajax endpoint.
+        
+        Args:
+            user_id: Pixiv user ID
+            
+        Returns:
+            User data dict or None if failed
+        """
+        try:
+            url = f"{self.AJAX_BASE}/user/{user_id}"
+            response = self._make_request(url)
+            data = response.json()
+            
+            if data.get("error"):
+                return None
+            
+            return data.get("body")
+        except Exception as e:
+            logger.error(f"Failed to fetch user via Ajax: {str(e)}")
+            return None
+
+    def parse_artwork_from_ajax(self, ajax_data: Dict[str, Any], artwork_id: int) -> Optional[ArtworkResponse]:
+        """Parse Ajax response to ArtworkResponse model.
+        
+        Args:
+            ajax_data: Ajax endpoint response data
+            artwork_id: Artwork ID
+            
+        Returns:
+            Parsed ArtworkResponse or None if parsing fails
+        """
+        try:
+            # Author info
+            author = AuthorInfo(
+                id=ajax_data.get("userId", 0),
+                name=ajax_data.get("userName", "Unknown"),
+                avatar_url=ajax_data.get("profileImageUrl"),
             )
 
+            # Images
+            images = []
+            page_count = ajax_data.get("pageCount", 1)
+            illust_type = ajax_data.get("illustType", 0)  # 0=illust, 1=manga, 2=ugoira
+            
+            if illust_type == 2:
+                # Ugoira (animation)
+                ugoira_meta = self.get_ugoira_metadata(artwork_id)
+                if ugoira_meta:
+                    images.append(ImageInfo(
+                        url=ugoira_meta.get("originalSrc"),  # ZIP file URL
+                        thumbnail=ajax_data.get("urls", {}).get("thumb_mini"),
+                        width=ajax_data.get("width"),
+                        height=ajax_data.get("height"),
+                    ))
+            elif page_count == 1:
+                # Single image
+                urls = ajax_data.get("urls", {})
+                original_url = urls.get("original")
+                if original_url:
+                    images.append(ImageInfo(
+                        url=original_url,
+                        thumbnail=urls.get("regular") or urls.get("small"),
+                        width=ajax_data.get("width"),
+                        height=ajax_data.get("height"),
+                    ))
+            else:
+                # Multiple images - extract all page URLs
+                base_url = ajax_data.get("urls", {}).get("original", "")
+                if base_url:
+                    # Replace p0 with p{i} for each page
+                    for i in range(page_count):
+                        page_url = re.sub(r"_p0\.", f"_p{i}.", base_url)
+                        images.append(ImageInfo(
+                            url=page_url,
+                            thumbnail=re.sub(r"img-original", "img-master", page_url).replace(
+                                re.search(r"\.(jpg|png|gif)", page_url).group(0),
+                                "_master1200.jpg"
+                            ) if re.search(r"\.(jpg|png|gif)", page_url) else None,
+                        ))
+
+            # Tags
+            tags_data = ajax_data.get("tags", {})
+            if isinstance(tags_data, dict):
+                tags = [tag.get("tag", "") for tag in tags_data.get("tags", []) if tag.get("tag")]
+            else:
+                tags = []
+
+            # Stats
+            stats = ArtworkStats(
+                likes=ajax_data.get("likeCount", 0),
+                bookmarks=ajax_data.get("bookmarkCount", 0),
+                views=ajax_data.get("viewCount", 0),
+            )
+
+            # Created date
             created_at = None
-            create_date = illust.get("createDate")
+            create_date = ajax_data.get("createDate")
             if create_date:
                 try:
-                    created_at = datetime.fromisoformat(str(create_date).replace("Z", "+00:00"))
+                    created_at = datetime.fromisoformat(create_date.replace("Z", "+00:00"))
                 except Exception:
-                    created_at = None
+                    pass
 
-            is_r18 = (illust.get("xRestrict") or 0) > 0 or ("R-18" in tags)
+            # R-18 detection
+            is_r18 = ajax_data.get("xRestrict", 0) > 0 or ajax_data.get("sl", 0) >= 6
 
             return ArtworkResponse(
                 id=artwork_id,
-                title=illust.get("title") or "Untitled",
+                title=ajax_data.get("title", "Untitled"),
                 author=author,
                 images=images,
                 tags=tags,
@@ -150,274 +261,134 @@ class PixivScraper:
                 created_at=created_at,
                 is_r18=is_r18,
                 page_count=page_count,
-                description=illust.get("description") or "",
+                description=ajax_data.get("description", ""),
                 related_artworks=[],
             )
         except Exception as e:
-            logger.error(f"Error building ArtworkResponse: {str(e)}", exc_info=True)
+            logger.error(f"Error parsing artwork from Ajax: {str(e)}", exc_info=True)
             return None
 
-    def parse_artwork_from_meta_preload(self, meta_data: Dict[str, Any], artwork_id: int) -> Optional[ArtworkResponse]:
-        try:
-            illust_key = str(artwork_id)
-            illusts = (meta_data or {}).get("illust") or {}
-            illust = illusts.get(illust_key)
-            if not illust:
-                return None
-            return self._build_artwork_response(illust, artwork_id)
-        except Exception as e:
-            logger.error(f"Error parsing artwork from meta-preload-data: {str(e)}", exc_info=True)
-            return None
-
-    def parse_artwork_from_next_data(self, next_data: Dict[str, Any], artwork_id: int) -> Optional[ArtworkResponse]:
-        """Try to locate illust data in __NEXT_DATA__.
-
-        Pixiv's Next.js payload shape can change; this searches common locations.
+    async def get_artwork_html(self, artwork_id: int) -> Optional[ArtworkResponse]:
+        """Get artwork data by scraping HTML (fallback method).
+        
+        Args:
+            artwork_id: Pixiv artwork ID
+            
+        Returns:
+            Parsed ArtworkResponse or None if failed
         """
         try:
-            illust_key = str(artwork_id)
-
-            # Common: props.pageProps.preload.illust[ID]
-            page_props = (((next_data or {}).get("props") or {}).get("pageProps") or {})
-            preload = page_props.get("preload") or page_props.get("preloadData") or {}
-            illusts = (preload.get("illust") or preload.get("illusts") or {})
-            if isinstance(illusts, dict) and illust_key in illusts:
-                return self._build_artwork_response(illusts[illust_key], artwork_id)
-
-            # Another: props.pageProps.dehydratedState.queries[*].state.data.illust[ID]
-            dehydrated = page_props.get("dehydratedState") or {}
-            queries = dehydrated.get("queries") or []
-            for q in queries:
-                state = (q or {}).get("state") or {}
-                data = state.get("data") or {}
-                ill = (data.get("illust") or {})
-                if isinstance(ill, dict) and illust_key in ill:
-                    return self._build_artwork_response(ill[illust_key], artwork_id)
-
-                # Sometimes data itself is an illust dict with id
-                if isinstance(data, dict) and str(data.get("id")) == illust_key:
-                    return self._build_artwork_response(data, artwork_id)
-
-            return None
-        except Exception as e:
-            logger.error(f"Error parsing artwork from __NEXT_DATA__: {str(e)}", exc_info=True)
-            return None
-
-    def _extract_images_from_html(self, soup: BeautifulSoup) -> List[ImageInfo]:
-        """Extract image URLs from HTML structure."""
-        images = []
-        
-        # Try to extract original image URL from expand-full-size-illust link
-        expand_links = soup.select('a.sc-440d5b2c-3.gtm-expand-full-size-illust, a[class*="expand-full-size"]')
-        for link in expand_links:
-            original_url = link.get('href', '')
-            if original_url and 'i.pximg.net/img-original/' in original_url:
-                # Try to get thumbnail from nearby img
-                img = link.select_one('img.sc-440d5b2c-1, img[class*="sc-"]')
-                thumb_url = img.get('src', '') if img else ''
-                
-                # Extract dimensions from style or attributes
-                width = height = None
-                if img:
-                    width_str = img.get('width')
-                    height_str = img.get('height')
-                    if width_str:
-                        try:
-                            width = int(width_str)
-                        except:
-                            pass
-                    if height_str:
-                        try:
-                            height = int(height_str)
-                        except:
-                            pass
-                
-                images.append(ImageInfo(
-                    url=original_url,
-                    thumbnail=thumb_url or original_url,
-                    width=width,
-                    height=height
-                ))
-        
-        # If no expand links found, try regular image tags
-        if not images:
-            img_tags = soup.select('img.sc-440d5b2c-1, img[src*="i.pximg.net"]')
-            for img in img_tags:
-                src = img.get('src', '')
-                if src and 'i.pximg.net' in src:
-                    # Try to convert master1200 to original URL
-                    original_url = src
-                    if 'img-master' in src and '_master1200' in src:
-                        # Convert: img-master/img/YYYY/MM/DD/HH/MM/SS/ID_p0_master1200.jpg
-                        # To: img-original/img/YYYY/MM/DD/HH/MM/SS/ID_p0.jpg
-                        original_url = src.replace('/img-master/', '/img-original/').replace('_master1200', '')
-                    
-                    width = height = None
-                    width_str = img.get('width')
-                    height_str = img.get('height')
-                    if width_str:
-                        try:
-                            width = int(width_str)
-                        except:
-                            pass
-                    if height_str:
-                        try:
-                            height = int(height_str)
-                        except:
-                            pass
-                    
-                    images.append(ImageInfo(
-                        url=original_url,
-                        thumbnail=src,
-                        width=width,
-                        height=height
-                    ))
-                    break  # Take first valid image
-        
-        return images
-
-    def parse_artwork_from_html(self, html: str, artwork_id: int) -> Optional[ArtworkResponse]:
-        try:
-            soup = BeautifulSoup(html, "lxml")
-
-            def meta_content(selector: str) -> Optional[str]:
-                tag = soup.select_one(selector)
-                return tag.get("content") if tag and tag.get("content") else None
-
-            # Title: h1 with multiple possible classes -> og:title -> twitter:title
-            title = "Untitled"
-            title_elem = soup.select_one("h1.sc-965e5f82-3, h1.kANgwp, h1[class*='sc-']")
-            if title_elem and title_elem.get_text(strip=True):
-                title = title_elem.get_text(strip=True)
-            else:
-                title = meta_content('meta[property="og:title"]') or meta_content('meta[name="twitter:title"]') or title
-
-            # Author: try user link + nearby name, else og:site_name fallback
-            author_link = soup.select_one('a[href^="/users/"], a[data-gtm-value][href*="/users/"]')
-            author_id = extract_user_id_from_url(author_link.get("href", "")) if author_link else 0
-
-            author_name = "Unknown"
-            # Try multiple selectors for author name
-            author_name_elem = soup.select_one('.sc-76df3bd1-6, .hzQYGJ, a[data-gtm-value][href^="/users/"] div')
-            if author_name_elem and author_name_elem.get_text(strip=True):
-                author_name = author_name_elem.get_text(strip=True)
-            else:
-                # Alternative: try to get from meta
-                og_site = meta_content('meta[property="og:site_name"]')
-                if og_site:
-                    author_name = og_site
-
-            # Author avatar
-            author_avatar = soup.select_one('a[href^="/users/"] img, .sc-653b72c8-0 img, div[role="img"] img')
-            avatar_url = author_avatar.get("src") if author_avatar else None
-
-            author = AuthorInfo(id=author_id, name=author_name, avatar_url=avatar_url)
-
-            # Images: use improved extraction
-            images = self._extract_images_from_html(soup)
+            url = f"{self.BASE_URL}/artworks/{artwork_id}"
+            response = await self.client.get(url, headers=self.headers)
+            response.raise_for_status()
             
-            # Fallback to og:image if no images found
-            if not images:
-                og_image = meta_content('meta[property="og:image"]')
-                if og_image:
-                    images.append(ImageInfo(url=og_image, thumbnail=og_image))
-
-            # Tags: multiple selectors
-            tag_links = soup.select('a.gtm-new-work-tag-event-click, a[href*="/tags/"], .sc-2af5a06c-0 a')
-            tags = []
-            for a in tag_links:
-                tag_text = a.get_text(strip=True)
-                if tag_text and tag_text not in tags:
-                    tags.append(tag_text)
-
-            # Stats: improved extraction with multiple selectors
-            likes = bookmarks = views = 0
+            soup = BeautifulSoup(response.text, "lxml")
             
-            # Try primary selector
-            stat_elements = soup.select('dl.sc-222c3018-1 dd, ul.sc-222c3018-0 dd')
-            if len(stat_elements) >= 3:
-                likes = parse_stat_number(stat_elements[0].get_text(strip=True))
-                bookmarks = parse_stat_number(stat_elements[1].get_text(strip=True))
-                views = parse_stat_number(stat_elements[2].get_text(strip=True))
-            else:
-                # Alternative: try individual icons/titles
-                like_elem = soup.select_one('dd[title="いいね！"], dd[title*="like"]')
-                bookmark_elem = soup.select_one('dd[title="ブックマーク"], dd[title*="bookmark"]')
-                view_elem = soup.select_one('dd[title="閲覧数"], dd[title*="view"]')
-                
-                if like_elem:
-                    likes = parse_stat_number(like_elem.get_text(strip=True))
-                if bookmark_elem:
-                    bookmarks = parse_stat_number(bookmark_elem.get_text(strip=True))
-                if view_elem:
-                    views = parse_stat_number(view_elem.get_text(strip=True))
-
-            stats = ArtworkStats(likes=likes, bookmarks=bookmarks, views=views)
-
-            # Created date
-            created_at = None
-            time_elem = soup.select_one("time[datetime]")
-            if time_elem and time_elem.get("datetime"):
-                try:
-                    created_at = datetime.fromisoformat(time_elem.get("datetime").replace("Z", "+00:00"))
-                except Exception:
-                    created_at = None
-
-            # R-18 detection
-            is_r18 = bool(soup.select_one('.sc-d71ae5c0-0, [class*="R-18"]')) or "R-18" in tags
-
-            # Description
-            description = ""
-            desc_elem = soup.select_one('p.sc-fcc502d1-1, p[id*="expandable-paragraph"]')
-            if desc_elem:
-                description = desc_elem.get_text(strip=True)
-
-            return ArtworkResponse(
-                id=artwork_id,
-                title=title,
-                author=author,
-                images=images,
-                tags=tags,
-                stats=stats,
-                created_at=created_at,
-                is_r18=is_r18,
-                page_count=max(1, len(images)) if images else 0,
-                description=description,
-                related_artworks=[],
-            )
+            # Try to extract JSON from meta tag
+            meta_tag = soup.find("meta", {"id": "meta-preload-data"})
+            if meta_tag and meta_tag.get("content"):
+                data = json.loads(meta_tag["content"])
+                illust_data = data.get("illust", {}).get(str(artwork_id))
+                if illust_data:
+                    return self.parse_artwork_from_ajax(illust_data, artwork_id)
+            
+            # Try Next.js data
+            next_data_script = soup.find("script", {"id": "__NEXT_DATA__"})
+            if next_data_script:
+                next_data = json.loads(next_data_script.string)
+                illust_data = (
+                    next_data.get("props", {})
+                    .get("pageProps", {})
+                    .get("illust", {})
+                )
+                if illust_data:
+                    return self.parse_artwork_from_ajax(illust_data, artwork_id)
+            
+            logger.warning(f"Could not extract artwork data from HTML for {artwork_id}")
+            return None
+            
         except Exception as e:
-            logger.error(f"Error parsing artwork from HTML: {str(e)}", exc_info=True)
+            logger.error(f"HTML scraping failed for artwork {artwork_id}: {str(e)}")
             return None
 
     async def get_artwork(self, artwork_id: int) -> Optional[ArtworkResponse]:
-        url = self.ARTWORK_URL_TEMPLATE.format(artwork_id)
-        logger.info(f"Fetching artwork from {url}")
-
-        html = await self.fetch_html(url)
-        if not html:
+        """Get artwork information (Ajax priority, HTML fallback).
+        
+        Args:
+            artwork_id: Pixiv artwork ID
+            
+        Returns:
+            Parsed ArtworkResponse or None if failed
+        """
+        try:
+            # Try Ajax endpoint first (faster and more reliable)
+            logger.info(f"Fetching artwork {artwork_id} via Ajax endpoint")
+            ajax_data = self.get_artwork_ajax(artwork_id)
+            if ajax_data:
+                artwork = self.parse_artwork_from_ajax(ajax_data, artwork_id)
+                if artwork:
+                    logger.info(f"Successfully fetched artwork {artwork_id} via Ajax")
+                    return artwork
+            
+            # Fallback to HTML scraping
+            logger.info(f"Falling back to HTML scraping for artwork {artwork_id}")
+            artwork = await self.get_artwork_html(artwork_id)
+            if artwork:
+                logger.info(f"Successfully fetched artwork {artwork_id} via HTML")
+                return artwork
+            
+            logger.error(f"All methods failed for artwork {artwork_id}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error fetching artwork {artwork_id}: {str(e)}", exc_info=True)
             return None
 
-        # 1) meta-preload-data
-        meta_data = self.extract_meta_preload_json(html)
-        if meta_data:
-            artwork = self.parse_artwork_from_meta_preload(meta_data, artwork_id)
-            if artwork:
-                logger.info(f"Successfully parsed artwork {artwork_id} from meta-preload-data")
-                return artwork
+    def download_image(self, url: str, output_path: str, artwork_id: int) -> bool:
+        """Download image from Pixiv.
+        
+        Args:
+            url: Image URL
+            output_path: Output file path
+            artwork_id: Artwork ID (for referer)
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            headers = {
+                **self.headers,
+                "Referer": f"{self.BASE_URL}/artworks/{artwork_id}"
+            }
+            
+            response = self._make_request(url, headers=headers, stream=True)
+            
+            # Create directory if not exists
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            
+            # Download with chunks
+            with open(output_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=self.CHUNK_SIZE):
+                    if chunk:
+                        f.write(chunk)
+            
+            logger.info(f"Downloaded image to {output_path}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to download image from {url}: {str(e)}")
+            return False
 
-        # 2) __NEXT_DATA__
-        next_data = self.extract_next_data_json(html)
-        if next_data:
-            artwork = self.parse_artwork_from_next_data(next_data, artwork_id)
-            if artwork:
-                logger.info(f"Successfully parsed artwork {artwork_id} from __NEXT_DATA__")
-                return artwork
-
-        # 3) Fallback: HTML
-        logger.info(f"Falling back to HTML parsing for artwork {artwork_id}")
-        artwork = self.parse_artwork_from_html(html, artwork_id)
-        if artwork:
-            logger.info(f"Successfully parsed artwork {artwork_id} from HTML")
-        else:
-            logger.warning(f"Failed to parse artwork {artwork_id}")
-        return artwork
+    def get_download_filename(self, url: str) -> str:
+        """Extract filename from URL.
+        
+        Args:
+            url: Image URL
+            
+        Returns:
+            Filename
+        """
+        match = re.search(r"\d+_(p\d+|ugoira).*?\.(jpg|png|gif|zip)", url)
+        if match:
+            return match.group(0)
+        return os.path.basename(url)
